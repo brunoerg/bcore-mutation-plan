@@ -1,0 +1,114 @@
+{
+  "schema_version": "1.0",
+  "pr": {
+    "number": 32150,
+    "base_sha": "082bb1a1047e9699605060aa93f17bb55110e062",
+    "head_sha": "7249b376a0adac3987977b47e74792dcb148af74",
+    "merge_base_sha": "58dccd27e11de68f810145fc30631a2c446f3bf5"
+  },
+  "decision": {
+    "mutate": true,
+    "reason": "The PR rewrites the core search loop of SelectCoinsBnB (wallet coin selection) with new control flow (SHIFT/CUT, lookahead, clone skipping, TOTAL_TRIES handling, attempt counting). This is a nontrivial behavioral refactor with money-relevant logic, so it is well suited to mutation testing."
+  },
+  "files": [
+    {
+      "path": "src/wallet/coinselection.cpp",
+      "priority": "high",
+      "reason": "The BnB search was reimplemented. The changes cover lookahead computation, the insufficient-funds check, the max-weight and overshoot cuts, high-feerate waste pruning, best-solution tracking, the TOTAL_TRIES limit, clone skipping, and SetSelectionsEvaluated/SetAlgoCompleted. The final waste recalculation and assertion were dropped. Boundary and off-by-one mutants (comparison operators, index arithmetic, curr_try counter) are likely and should be caught by the exact attempt-count assertions.",
+      "functions": [
+        "SelectCoinsBnB"
+      ],
+      "changed_lines": [
+        {
+          "start": 118,
+          "end": 264
+        }
+      ],
+      "tests": {
+        "unit": [
+          {
+            "id": "unit:coinselection_tests",
+            "reason": "Directly calls SelectCoinsBnB. The PR added expected-attempts checks to its BnB success cases, so it is sensitive to search order and the attempt counter.",
+            "confidence": "high",
+            "evidence": [
+              "ev-0004",
+              "ev-0005"
+            ],
+            "command": "build/bin/test_bitcoin --run_test=coinselection_tests"
+          },
+          {
+            "id": "unit:coinselector_tests/bnb_search_test",
+            "reason": "Calls SelectCoinsBnB directly and through SelectCoins. The PR added GetSelectionsEvaluated assertions with exact counts (1, 3, 2, 22).",
+            "confidence": "high",
+            "evidence": [
+              "ev-0007",
+              "ev-0008",
+              "ev-0009"
+            ],
+            "command": "build/bin/test_bitcoin --run_test=coinselector_tests/bnb_search_test"
+          }
+        ],
+        "functional": [
+          {
+            "id": "functional:wallet_fundrawtransaction.py",
+            "reason": "Exercises end-to-end coin selection through fundrawtransaction. The call path to SelectCoinsBnB is inferred and long.",
+            "confidence": "low",
+            "evidence": [
+              "ev-0057",
+              "ev-0058"
+            ],
+            "command": "build/test/functional/test_runner.py wallet_fundrawtransaction.py"
+          },
+          {
+            "id": "functional:interface_usdt_coinselection.py",
+            "reason": "Observes coin selection through tracepoints after sendtoaddress and may reflect BnB selection results. The call path is inferred.",
+            "confidence": "low",
+            "evidence": [
+              "ev-0023",
+              "ev-0025"
+            ],
+            "command": "build/test/functional/test_runner.py interface_usdt_coinselection.py"
+          }
+        ],
+        "fuzz": [
+          {
+            "id": "fuzz:bnb_finds_min_waste",
+            "reason": "Directly references SelectCoinsBnB and checks whether it finds the minimum-waste selection. This is well suited to detecting a faulty search or pruning change.",
+            "confidence": "high",
+            "evidence": [
+              "ev-0001",
+              "ev-0002"
+            ],
+            "command": "FUZZ=bnb_finds_min_waste build_fuzz/bin/fuzz"
+          },
+          {
+            "id": "fuzz:coinselection_bnb",
+            "reason": "Fuzzes the BnB selection path. The static evidence is only a header include and name similarity.",
+            "confidence": "medium",
+            "evidence": [
+              "ev-0017"
+            ],
+            "command": "FUZZ=coinselection_bnb build_fuzz/bin/fuzz"
+          }
+        ]
+      },
+      "uncertainty": "The functional tests reach SelectCoinsBnB only through long, statically inferred RPC call chains. No dynamic coverage is provided, and 40 lower-ranked candidates were truncated, none of them direct."
+    }
+  ],
+  "warnings": [
+    "Candidate list was truncated (40 of 80 kept, 0 direct dropped).",
+    "Test relationships are static or inferred; no coverage data was provided.",
+    "context truncated (candidates:src/wallet/coinselection.cpp): kept 40 of 80 candidate tests (dropped 40, of which 0 direct); raise --max-candidates-per-file to include more"
+  ],
+  "metadata": {
+    "provider": "claude-code",
+    "model": "sonnet",
+    "prompt_version": "1.0",
+    "prompt_sha256": "487d0af5e0c627441abaf255d03e0c5d6c8094580eeb67575feb111a1ffb25cc",
+    "context_sha256": "2e980468fd757f40056e5d53b7acbbeba8225137b2765b1bef29c1917438a91a",
+    "tool_version": "0.1.0",
+    "head_tree_sha": "3f97dfd80759a057e8f828ba49a461779ec013bd",
+    "validation_status": "valid",
+    "llm_attempts": 1
+  }
+}

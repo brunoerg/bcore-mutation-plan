@@ -1,0 +1,131 @@
+# Phase B: privileged planning.
+#
+# Triggered after "Mutation plan context" (mutation-plan.yml) completes. This job holds
+# the LLM credential, so it:
+#   * never checks out or executes code from the PR,
+#   * verifies the triggering workflow (path + repository) and, for pull_request runs,
+#     that the context was produced for the triggering run's head commit,
+#   * treats every field of the downloaded artifact as untrusted data (it is parsed by
+#     the planner's strict schema; no field is ever interpolated into a shell command),
+#   * only uploads the validated plan as an artifact (no PR comments, no writes).
+#
+# Required configuration (Settings -> Secrets and variables -> Actions):
+#   vars.MUTATION_PLANNER_ENABLED  = "true"
+#   vars.MUTATION_PLANNER_SPEC     = pinned planner source (see mutation-plan.yml)
+#   vars.MUTATION_PLANNER_PROVIDER = "opencode-zen" (default) or "claude-code"
+#   vars.MUTATION_PLANNER_MODEL    = model id, e.g. "claude-sonnet-5-5" (Zen) or "sonnet"
+#   secrets.OPENCODE_ZEN_API_KEY   for opencode-zen, or
+#   secrets.ANTHROPIC_API_KEY      for claude-code (API-key auth; a personal Claude
+#                                  subscription login is NOT used in CI)
+
+name: Mutation plan (LLM)
+
+on:
+  workflow_run:
+    workflows: ["Mutation plan context"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read   # download the artifact of the triggering run
+
+jobs:
+  plan:
+    if: >-
+      vars.MUTATION_PLANNER_ENABLED == 'true' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.path == '.github/workflows/mutation-plan.yml' &&
+      github.event.workflow_run.repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PROVIDER: ${{ vars.MUTATION_PLANNER_PROVIDER || 'opencode-zen' }}
+      MODEL: ${{ vars.MUTATION_PLANNER_MODEL }}
+      PLANNER_SPEC: ${{ vars.MUTATION_PLANNER_SPEC }}
+      RUN_EVENT: ${{ github.event.workflow_run.event }}
+      RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out planner from the default branch (never PR code)
+        if: env.PLANNER_SPEC == ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: planner
+          persist-credentials: false
+
+      - name: Install planner
+        run: |
+          if [ -n "$PLANNER_SPEC" ]; then
+            python -m pip install "$PLANNER_SPEC"
+          elif [ -f planner/pyproject.toml ] && grep -q '^name = "mutation-planner"' planner/pyproject.toml; then
+            python -m pip install ./planner
+          else
+            echo "::error::Set repository variable MUTATION_PLANNER_SPEC"; exit 1
+          fi
+
+      - name: Install Claude Code CLI
+        if: env.PROVIDER == 'claude-code'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Download context artifact from the triggering run
+        uses: actions/download-artifact@v4
+        with:
+          name: mutation-context
+          path: ${{ runner.temp }}/context
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify artifact provenance
+        env:
+          CONTEXT_DIR: ${{ runner.temp }}/context
+        run: |
+          python - <<'EOF'
+          import os, sys
+          from pathlib import Path
+          from mutation_planner.analysis import load_context
+          d = Path(os.environ["CONTEXT_DIR"])
+          files = sorted(p.name for p in d.iterdir())
+          if files != ["mutation-context.json"]:
+              sys.exit(f"unexpected artifact contents: {files}")
+          f = d / "mutation-context.json"
+          if f.stat().st_size > 50_000_000:
+              sys.exit("context artifact too large")
+          ctx = load_context(f)  # strict schema validation (extra fields rejected)
+          if os.environ["RUN_EVENT"] == "pull_request" and ctx.snapshot.head_sha != os.environ["RUN_HEAD_SHA"]:
+              sys.exit("context head_sha does not match the triggering pull_request run")
+          print(f"context OK: head={ctx.snapshot.head_sha} merge-base={ctx.snapshot.merge_base_sha}")
+          EOF
+
+      - name: Generate and validate plan
+        env:
+          OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CONTEXT_FILE: ${{ runner.temp }}/context/mutation-context.json
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          MODEL_ARGS=()
+          if [ -n "$MODEL" ]; then MODEL_ARGS=(--model "$MODEL"); fi
+          python -m mutation_planner \
+            --context-file "$CONTEXT_FILE" \
+            --provider "$PROVIDER" "${MODEL_ARGS[@]}" \
+            --output out/mutation-plan.json \
+            --metadata-output out/mutation-run-metadata.json
+          # Re-validate the written artifact against the context independently.
+          python -m mutation_planner --context-file "$CONTEXT_FILE" --validate-plan out/mutation-plan.json
+
+      - name: Upload plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-plan
+          path: |
+            out/mutation-plan.json
+            out/mutation-run-metadata.json
+          if-no-files-found: warn
+          retention-days: 30

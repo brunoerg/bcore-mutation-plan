@@ -1,0 +1,151 @@
+# Phase A: unprivileged context collection.
+#
+# Runs on pull requests (including forks) WITHOUT any LLM credentials. It checks out the
+# PR as data, runs the deterministic analyzer (`--dry-run`) and uploads a bounded,
+# structured `mutation-context.json`. It never executes scripts from the PR.
+#
+# Phase B (`mutation-plan-llm.yml`) consumes this artifact in a privileged
+# `workflow_run` job that holds the API secret but never checks out PR code.
+#
+# Install this workflow in a Bitcoin Core repository (or fork). The planner itself is
+# installed from `vars.MUTATION_PLANNER_SPEC`, e.g.
+#   git+https://github.com/OWNER/mutation-planner@<full commit sha>
+# When that variable is unset and this workflow runs inside the planner repository,
+# the planner is installed from the workflow's own commit (useful with
+# workflow_dispatch to analyse an upstream Bitcoin Core PR).
+
+name: Mutation plan context
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Repository containing the PR"
+        default: "bitcoin/bitcoin"
+        required: true
+      pr_number:
+        description: "Pull request number to analyse"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-plan-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  context:
+    # Opt-in for pull_request so that installing this file is harmless until configured.
+    if: github.event_name == 'workflow_dispatch' || vars.MUTATION_PLANNER_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PLANNER_SPEC: ${{ vars.MUTATION_PLANNER_SPEC }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out planner (only when no MUTATION_PLANNER_SPEC is configured)
+        if: env.PLANNER_SPEC == ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: planner
+          persist-credentials: false
+
+      - name: Install planner
+        run: |
+          if [ -n "$PLANNER_SPEC" ]; then
+            python -m pip install "$PLANNER_SPEC"
+          elif [ -f planner/pyproject.toml ] && grep -q '^name = "mutation-planner"' planner/pyproject.toml; then
+            python -m pip install ./planner
+          else
+            echo "::error::Set repository variable MUTATION_PLANNER_SPEC to a pinned planner source"
+            exit 1
+          fi
+
+      # ---- pull_request: analyse this repository's PR --------------------------------
+      - name: Check out PR (as data)
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: bitcoin
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch base commit
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git -C bitcoin fetch --no-tags --quiet origin "$BASE_SHA"
+
+      - name: Resolve PR commits (pull_request)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "BASE_SHA=$BASE_SHA"
+            echo "HEAD_SHA=$HEAD_SHA"
+            echo "PR_NUMBER=$PR_NUMBER"
+          } >> "$GITHUB_ENV"
+
+      # ---- workflow_dispatch: analyse a PR from another repository -------------------
+      - name: Fetch PR (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+          PR_NUMBER_INPUT: ${{ inputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER_INPUT" =~ ^[0-9]+$ ]] || { echo "::error::pr_number must be numeric"; exit 1; }
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "::error::bad repository"; exit 1; }
+          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER_INPUT" > pr.json
+          BASE_REF=$(jq -r .base.ref pr.json)
+          HEAD_SHA=$(jq -r .head.sha pr.json)
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad head sha"; exit 1; }
+          git init -q bitcoin
+          git -C bitcoin remote add origin "https://github.com/$REPOSITORY.git"
+          git -C bitcoin fetch --no-tags --quiet origin \
+            "refs/heads/$BASE_REF:refs/remotes/origin/base" "refs/pull/$PR_NUMBER_INPUT/head:refs/remotes/origin/pr"
+          {
+            echo "BASE_SHA=$(git -C bitcoin rev-parse refs/remotes/origin/base)"
+            echo "HEAD_SHA=$HEAD_SHA"
+            echo "PR_NUMBER=$PR_NUMBER_INPUT"
+          } >> "$GITHUB_ENV"
+          jq -r .title pr.json > pr-title.txt
+          jq -r '.body // ""' pr.json > pr-body.txt
+
+      # ---- analysis (no secrets in this job) ------------------------------------------
+      - name: Analyse PR and write mutation-context.json
+        env:
+          # Untrusted text is passed through env vars, never interpolated into the script.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          if [ -f pr-title.txt ]; then PR_TITLE=$(cat pr-title.txt); PR_BODY=$(cat pr-body.txt); fi
+          mkdir -p out
+          python -m mutation_planner \
+            --repo bitcoin --base "$BASE_SHA" --head "$HEAD_SHA" \
+            --pr-number "$PR_NUMBER" --pr-title "$PR_TITLE" --pr-description "$PR_BODY" \
+            --dry-run --context-output out/mutation-context.json
+          # Bound the artifact size before handing it to the privileged phase.
+          test "$(stat -c %s out/mutation-context.json)" -lt 50000000
+
+      - name: Upload context artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-context
+          path: out/mutation-context.json
+          if-no-files-found: error
+          retention-days: 14
