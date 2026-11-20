@@ -1,5 +1,5 @@
-"""Planning pipeline: one LLM call, deterministic validation, optional single retry,
-and application-side enrichment of the final artifact."""
+"""Planning pipeline: one LLM call, deterministic validation and repair, optional single
+retry, and application-side enrichment of the final artifact."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from .schemas import (
     TestCategory,
     llm_output_schema,
 )
-from .validator import ValidationReport, parse_llm_plan, validate_plan
+from .validator import ValidationReport, parse_llm_plan, repair_plan, validate_plan
 
 log = logging.getLogger(__name__)
 
@@ -36,10 +36,14 @@ _VERSION_RE = re.compile(r"<!--\s*prompt-version:\s*([0-9A-Za-z.\-]+)\s*-->")
 
 
 class PlanningError(RuntimeError):
-    def __init__(self, message: str, report: ValidationReport | None = None, attempts: int = 0):
+    def __init__(
+        self, message: str, report: ValidationReport | None = None, attempts: int = 0,
+        attempt_errors: list[list[str]] | None = None,
+    ):
         super().__init__(message)
         self.report = report
         self.attempts = attempts
+        self.attempt_errors = attempt_errors or []
 
 
 class IncompleteAnalysisError(PlanningError):
@@ -73,6 +77,18 @@ def load_prompt(path: str | None = None) -> Prompt:
     return Prompt(text=text, version=m.group(1), sha256=hashlib.sha256(text.encode()).hexdigest(), path=str(p))
 
 
+def static_prompt() -> Prompt:
+    """Provenance for the ``static`` provider: its rules play the role of the prompt."""
+    from .llm import static
+
+    src = Path(static.__file__)
+    text = src.read_text()
+    return Prompt(
+        text="", version=f"static-{static.STATIC_RULES_VERSION}",
+        sha256=hashlib.sha256(text.encode()).hexdigest(), path=str(src),
+    )
+
+
 def context_sha256(ctx: MutationContext) -> str:
     return hashlib.sha256(ctx.model_dump_json().encode()).hexdigest()
 
@@ -82,6 +98,11 @@ class PlanResult:
     plan: MutationPlan
     attempts: int
     warnings: list[str] = field(default_factory=list)
+    # Validation errors of every model response that failed, as returned (before repair).
+    attempt_errors: list[list[str]] = field(default_factory=list)
+
+
+NO_PRODUCTION_REASON = "No production code changed: the PR touches only {kinds}."
 
 
 def run_planner(
@@ -97,11 +118,25 @@ def run_planner(
             + "; ".join(ctx.analysis_limitations)
         )
     max_tests = int(ctx.limits.get("max_tests_per_file", config.limits.max_tests_per_file))
-    view = llm_view(ctx)
+
+    if not ctx.production_files:
+        # Nothing to mutate, whatever a model would say: decide without an LLM call.
+        kinds = sorted({c.classification.value for c in ctx.changed_files}) or ["nothing"]
+        plan = LLMPlan.model_validate({
+            "decision": {"mutate": False, "reason": NO_PRODUCTION_REASON.format(kinds=", ".join(kinds))},
+            "files": [],
+            "warnings": ["decided without an LLM call: no changed production file exists at the PR head"],
+        })
+        report = validate_plan(plan, ctx, max_tests)
+        log.info("no production files changed; skipping the LLM call")
+        final = enrich(plan, ctx, provider_name, getattr(provider, "model", None), prompt, 0, report)
+        return PlanResult(plan=final, attempts=0, warnings=final.warnings)
+
+    view = llm_view(ctx, config.include_inventory_index)
     schema = llm_output_schema()
     attempts = 0
+    attempt_errors: list[list[str]] = []
     feedback: dict[str, Any] | None = None
-    last_report: ValidationReport | None = None
     while True:
         attempts += 1
         payload = dict(view)
@@ -116,14 +151,23 @@ def run_planner(
         plan, report = parse_llm_plan(raw)
         if plan is not None:
             report = validate_plan(plan, ctx, max_tests)
-        last_report = report
         if report.ok and plan is not None:
             log.info("validation passed (%d warnings)", len(report.warnings))
             break
         log.warning("validation failed with %d errors:\n  %s", len(report.errors), "\n  ".join(report.errors[:30]))
+        attempt_errors.append(list(report.errors))
+        if plan is not None:
+            # Fix what can be fixed by removing or downgrading; a re-ask resends the whole context.
+            repaired, notes = repair_plan(plan, ctx, max_tests)
+            rreport = validate_plan(repaired, ctx, max_tests)
+            if rreport.ok:
+                log.warning("plan repaired deterministically (%d change(s)); no retry needed", len(notes))
+                plan, report = repaired, ValidationReport(warnings=notes + rreport.warnings)
+                break
         if attempts > config.max_llm_retries:
             raise PlanningError(
-                f"LLM plan failed validation after {attempts} attempt(s)", report=report, attempts=attempts
+                f"LLM plan failed validation after {attempts} attempt(s)", report=report, attempts=attempts,
+                attempt_errors=attempt_errors,
             )
         feedback = {
             "instruction": "Your previous response failed deterministic validation. Return a corrected, complete "
@@ -131,9 +175,9 @@ def run_planner(
             "validation_errors": report.errors[:60],
             "previous_response": raw,
         }
-    assert plan is not None and last_report is not None
-    final = enrich(plan, ctx, provider_name, getattr(provider, "model", None), prompt, attempts, last_report)
-    return PlanResult(plan=final, attempts=attempts, warnings=final.warnings)
+    assert plan is not None
+    final = enrich(plan, ctx, provider_name, getattr(provider, "model", None), prompt, attempts, report)
+    return PlanResult(plan=final, attempts=attempts, warnings=final.warnings, attempt_errors=attempt_errors)
 
 
 def enrich(
@@ -205,6 +249,7 @@ def run_metadata(
     status: str,
     errors: list[str] | None = None,
     attempts: int = 0,
+    attempt_errors: list[list[str]] | None = None,
 ) -> dict[str, Any]:
     return {
         "base_sha": ctx.snapshot.base_sha,
@@ -220,6 +265,7 @@ def run_metadata(
         "llm_attempts": attempts,
         "validation_status": status,
         "validation_errors": errors or [],
+        "attempt_errors": attempt_errors or [],
     }
 
 

@@ -1,7 +1,9 @@
 """Deterministic validation of LLM plans against the recorded repository context.
 
-The validator never repairs a plan by guessing: it reports errors (which make the plan
-invalid) and warnings (which are carried into the final artifact).
+``validate_plan`` reports errors (which make the plan invalid) and warnings (which are
+carried into the final artifact). ``repair_plan`` fixes the subset of errors that can be
+fixed by *removing* or *downgrading* something the model returned, never by guessing a
+replacement; every repair is reported as a warning.
 """
 
 from __future__ import annotations
@@ -156,6 +158,98 @@ def validate_plan(plan: LLMPlan, ctx: MutationContext, max_tests_per_file: int) 
         if no_tests:
             W(f"{f.path}: no existing tests selected; mutants in this file may go undetected or be untested")
     return report
+
+
+_CONF_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def repair_plan(plan: LLMPlan, ctx: MutationContext, max_tests_per_file: int) -> tuple[LLMPlan, list[str]]:
+    """Remove or downgrade invalid parts of a plan so that a re-ask is not needed.
+
+    Repairs: drop file selections that are not changed production files at the head (and
+    duplicate files); drop unknown function names and line ranges outside the changed code;
+    drop unknown or duplicate tests; move a test listed under the wrong category; drop
+    evidence IDs that do not exist or concern another test or file; downgrade ``high`` /
+    ``medium`` confidence to ``low`` when no valid evidence (or only name similarity)
+    remains; keep the highest-confidence tests when the per-file budget is exceeded.
+    Not repaired (they need the model): schema errors, empty reasons, and an eligibility
+    decision that contradicts the file list. Returns the repaired plan and its warnings.
+    """
+    changed = {c.path: c for c in ctx.changed_files}
+    targets = {p.path: p for p in ctx.production_files}
+    inventory = ctx.test_inventory.by_id()
+    evidence = {e.id: e for e in ctx.evidence}
+    notes: list[str] = []
+    N = notes.append
+
+    data = plan.model_dump(mode="json")
+    files: list[dict[str, Any]] = []
+    for f in data["files"]:
+        path = f["path"]
+        cf, src = changed.get(path), targets.get(path)
+        if cf is None or cf.classification not in PRODUCTION_CLASSES or not cf.exists_at_head or src is None:
+            N(f"auto-repaired: dropped {path}, which is not a changed production file at the PR head")
+            continue
+        if any(x["path"] == path for x in files):
+            N(f"auto-repaired: dropped duplicate selection of {path}")
+            continue
+
+        known = {fn.name for fn in src.functions} | {fn.short_name for fn in src.functions}
+        if bad := [fn for fn in f["functions"] if fn not in known]:
+            N(f"auto-repaired: {path}: dropped unknown function(s) {', '.join(bad)}")
+            f["functions"] = [fn for fn in f["functions"] if fn in known]
+
+        allowed = list(cf.changed_lines)
+        allowed += [LineRange(start=fn.start_line, end=fn.end_line) for fn in src.functions]
+        allowed += [LineRange(start=a, end=a) for a in cf.deletion_anchors]
+        n_lines = cf.head_line_count or 0
+        kept_lines = []
+        for r in f["changed_lines"]:
+            lr = LineRange(**r)
+            if lr.end <= n_lines and any(lr.overlaps(a) for a in allowed):
+                kept_lines.append(r)
+            else:
+                N(f"auto-repaired: {path}: dropped line range {lr.start}-{lr.end} outside the changed code")
+        f["changed_lines"] = kept_lines
+
+        picked: list[tuple[str, dict[str, Any]]] = []
+        seen: set[str] = set()
+        for cat in TestCategory:
+            for t in f["tests"][cat.value]:
+                tid = t["id"]
+                entry = inventory.get(tid)
+                if entry is None:
+                    N(f"auto-repaired: {path}: dropped {tid}, which is not in the test inventory")
+                    continue
+                if tid in seen:
+                    N(f"auto-repaired: {path}: dropped duplicate selection of {tid}")
+                    continue
+                seen.add(tid)
+                if entry.category != cat:
+                    N(f"auto-repaired: {path}: moved {tid} from {cat.value} to {entry.category.value}")
+                good_ev = []
+                for eid in t["evidence"]:
+                    ev = evidence.get(eid)
+                    if ev is None or not _supports(ev.test_id, tid) or ev.source_file != path:
+                        N(f"auto-repaired: {path}: removed evidence {eid} from {tid} (unknown, or about another test or file)")
+                    else:
+                        good_ev.append(eid)
+                t["evidence"] = good_ev
+                rels = {evidence[e].relationship for e in good_ev}
+                if t["confidence"] in ("high", "medium") and (not good_ev or rels <= WEAK_RELATIONSHIPS):
+                    N(f"auto-repaired: {path}: downgraded {tid} from {t['confidence']} to low confidence (no supporting evidence)")
+                    t["confidence"] = "low"
+                picked.append((entry.category.value, t))
+        if len(picked) > max_tests_per_file:
+            ranked = sorted(range(len(picked)), key=lambda i: (_CONF_ORDER[picked[i][1]["confidence"]], i))
+            keep = set(ranked[:max_tests_per_file])
+            dropped = [picked[i][1]["id"] for i in range(len(picked)) if i not in keep]
+            N(f"auto-repaired: {path}: over the budget of {max_tests_per_file} tests; dropped {', '.join(dropped)}")
+            picked = [picked[i] for i in range(len(picked)) if i in keep]
+        f["tests"] = {cat.value: [t for c, t in picked if c == cat.value] for cat in TestCategory}
+        files.append(f)
+    data["files"] = files
+    return LLMPlan.model_validate(data), notes
 
 
 def validate_final_plan(raw: dict[str, Any], ctx: MutationContext) -> ValidationReport:

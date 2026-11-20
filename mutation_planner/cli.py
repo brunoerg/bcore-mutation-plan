@@ -13,7 +13,15 @@ from .analysis import build_context, load_context
 from .config import DEFAULT_CONTEXT_OUTPUT, DEFAULT_OUTPUT, DEFAULT_PROVIDER, DEFAULT_TIMEOUT, ContextLimits, PlannerConfig
 from .git_analysis import GitError
 from .llm import PROVIDERS, ProviderError, create_provider
-from .planner import IncompleteAnalysisError, PlanningError, dump_json, load_prompt, run_metadata, run_planner
+from .planner import (
+    IncompleteAnalysisError,
+    PlanningError,
+    dump_json,
+    load_prompt,
+    run_metadata,
+    run_planner,
+    static_prompt,
+)
 from .schemas import PRMetadata
 from .validator import validate_final_plan
 
@@ -38,11 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--pr-description")
 
     llm = p.add_argument_group("LLM")
-    llm.add_argument("--provider", default=DEFAULT_PROVIDER, help=f"One of: {', '.join(PROVIDERS)} (default: {DEFAULT_PROVIDER})")
+    llm.add_argument("--provider", default=DEFAULT_PROVIDER, help=f"One of: {', '.join(PROVIDERS)} (default: {DEFAULT_PROVIDER}). 'static' is a deterministic, LLM-free baseline")
     llm.add_argument("--model", help="Model name/alias for the provider (e.g. sonnet, PROVIDER/MODEL, Zen model id)")
     llm.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="LLM call timeout in seconds")
     llm.add_argument("--max-retries", type=int, default=1, help="LLM retries after a validation failure (default 1)")
     llm.add_argument("--prompt-file", help="Override prompts/mutation_planner_system.md")
+    llm.add_argument("--include-inventory-index", action="store_true",
+                     help="Also send every unit suite, functional test and fuzz target ID, so the model can pick "
+                          "tests that are not candidates (larger context)")
     llm.add_argument("--zen-api-format", choices=["chat-completions", "responses", "messages", "generate-content"])
     llm.add_argument("--zen-base-url", help="Override the Zen base URL for the selected format")
 
@@ -95,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
             max_call_depth=args.max_call_depth,
         ),
         max_llm_retries=args.max_retries,
+        include_inventory_index=args.include_inventory_index,
         timeout=args.timeout,
     )
 
@@ -131,7 +143,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK if ctx.analysis_complete else EXIT_INCOMPLETE
 
     # 2. Plan with the selected provider.
-    prompt = load_prompt(args.prompt_file)
+    if args.provider == "static":
+        # Deterministic baseline: no prompt, and a retry would return the same plan.
+        prompt = static_prompt()
+        config.max_llm_retries = 0
+        if args.model:
+            log.warning("--model is ignored by the static provider")
+            args.model = None
+    else:
+        prompt = load_prompt(args.prompt_file)
     provider_cfg = {
         "model": args.model, "timeout": args.timeout,
         "zen_api_format": args.zen_api_format, "zen_base_url": args.zen_base_url,
@@ -139,7 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     meta_path = args.metadata_output or None
     try:
         provider = create_provider(args.provider, provider_cfg)
-        log.info("provider: %s (model: %s)", args.provider, args.model or "provider default")
+        log.info("provider: %s (model: %s)", args.provider,
+                 "none" if args.provider == "static" else args.model or "provider default")
         result = run_planner(ctx, provider, args.provider, config, prompt)
     except IncompleteAnalysisError as exc:
         log.error("%s", exc)
@@ -157,12 +178,14 @@ def main(argv: list[str] | None = None) -> int:
         for e in errors:
             log.error("  %s", e)
         if meta_path:
-            dump_json(run_metadata(ctx, args.provider, args.model, prompt, "invalid", errors, exc.attempts), meta_path)
+            dump_json(run_metadata(ctx, args.provider, args.model, prompt, "invalid", errors, exc.attempts,
+                                   exc.attempt_errors), meta_path)
         return EXIT_PLAN_INVALID
 
     dump_json(result.plan, args.output)
     if meta_path:
-        dump_json(run_metadata(ctx, args.provider, args.model, prompt, "valid", attempts=result.attempts), meta_path)
+        dump_json(run_metadata(ctx, args.provider, args.model, prompt, "valid", attempts=result.attempts,
+                               attempt_errors=result.attempt_errors), meta_path)
     n_tests = sum(len(t) for f in result.plan.files for t in (f.tests.unit, f.tests.functional, f.tests.fuzz))
     log.info(
         "wrote %s: mutate=%s, %d file(s), %d test selection(s), %d warning(s)",

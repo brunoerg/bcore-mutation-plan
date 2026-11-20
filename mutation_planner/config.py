@@ -54,6 +54,10 @@ class RepoConventions:
         "src/ipc/libmultiprocess/",
         "src/crypto/ctaes/",
     )
+    # Stale-base detection: Bitcoin Core PRs are rebased, linear branches, so merge commits
+    # between the merge base and the head, or a very long history, mean the --base ref is
+    # older than the branch the PR was built on (upstream work would be analysed as PR changes).
+    stale_base_max_commits: int = 100
     # Files produced by generator scripts that carry no "generated" banner.
     known_generated: tuple[str, ...] = (
         "src/chainparamsseeds.h",
@@ -90,4 +94,5 @@ class PlannerConfig:
     limits: ContextLimits = field(default_factory=ContextLimits)
     conventions: RepoConventions = field(default_factory=RepoConventions)
     max_llm_retries: int = 1
+    include_inventory_index: bool = False  # send the full test inventory to the LLM (larger context)
     timeout: int = DEFAULT_TIMEOUT

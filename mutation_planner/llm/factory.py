@@ -8,8 +8,9 @@ from .base import LLMProvider, ProviderError
 from .claude_code import ClaudeCodeProvider
 from .opencode_cli import OpenCodeProvider
 from .opencode_zen import OpenCodeZenProvider
+from .static import StaticProvider
 
-PROVIDERS = ("claude-code", "opencode", "opencode-zen")
+PROVIDERS = ("claude-code", "opencode", "opencode-zen", "static")
 
 
 def create_provider(name: str, config: dict[str, Any]) -> LLMProvider:
@@ -24,4 +25,6 @@ def create_provider(name: str, config: dict[str, Any]) -> LLMProvider:
             model=model, timeout=timeout,
             api_format=config.get("zen_api_format"), base_url=config.get("zen_base_url"),
         )
+    if name == "static":
+        return StaticProvider()
     raise ProviderError("config", f"unsupported provider {name!r}; choose one of: {', '.join(PROVIDERS)}")
