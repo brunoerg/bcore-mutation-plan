@@ -87,3 +87,56 @@ def test_parse_raw_and_numstat_with_rename():
     assert changes[1].status == ChangeStatus.deleted and changes[1].head_blob_sha is None
     ns = parse_numstat(b"3\t1\t\0old/a.cpp\0new/a.cpp\0-\t-\timg.png\0")
     assert ns == {"new/a.cpp": (3, 1), "img.png": (None, None)}
+
+
+def _stale_base_repo(repo):
+    """Upstream merges a PR into main, the PR branch is rebased onto the new main, and
+    --base is the old main: the upstream work ends up in merge-base..head."""
+    old_main = repo.base
+    git(repo.path, "checkout", "-q", "-b", "upstream-work", old_main)
+    write_files(repo.path, {"src/wallet/spend.cpp": BASE_FILES["src/wallet/spend.cpp"] + "// upstream\n"})
+    git(repo.path, "commit", "-qam", "upstream work")
+    git(repo.path, "checkout", "-q", "main")
+    git(repo.path, "merge", "-q", "--no-ff", "-m", "Merge bitcoin/bitcoin#1: upstream work", "upstream-work")
+    git(repo.path, "checkout", "-q", "-B", "pr", "main")
+    write_files(repo.path, {"src/policy/fees.cpp": BASE_FILES["src/policy/fees.cpp"] + "// pr\n"})
+    git(repo.path, "commit", "-qam", "pr change")
+    head = git(repo.path, "rev-parse", "HEAD")
+    git(repo.path, "checkout", "-q", "main")
+    return old_main, head
+
+
+def test_stale_base_is_reported(repo, config):
+    from mutation_planner.analysis import build_context
+    from mutation_planner.schemas import PRMetadata
+
+    old_main, head = _stale_base_repo(repo)
+    diff = analyze_diff(GitRepo(repo.path), old_main, head)
+    assert diff.merge_count == 1 and diff.commit_count == 3
+    assert diff.merge_samples[0][1] == "Merge bitcoin/bitcoin#1: upstream work"
+    # the upstream file shows up as a "PR change": exactly the symptom being detected
+    assert "src/wallet/spend.cpp" in by_path(diff)
+    ctx = build_context(repo.path, old_main, head, PRMetadata(), config)
+    assert any("looks stale" in w and "1 merge commit" in w for w in ctx.warnings)
+
+    # With the fresh base, the range is the PR's single commit and nothing is reported.
+    fresh = git(repo.path, "rev-parse", "main")
+    ctx = build_context(repo.path, fresh, head, PRMetadata(), config)
+    assert not any("looks stale" in w for w in ctx.warnings)
+    assert {c.path for c in ctx.changed_files} == {"src/policy/fees.cpp"}
+
+
+def test_long_history_is_reported(repo, config):
+    from mutation_planner.analysis import build_context
+    from mutation_planner.schemas import PRMetadata
+
+    git(repo.path, "checkout", "-q", "-B", "pr", repo.base)
+    for i in range(3):
+        write_files(repo.path, {"src/policy/fees.cpp": BASE_FILES["src/policy/fees.cpp"] + f"// {i}\n"})
+        git(repo.path, "commit", "-qam", f"c{i}")
+    head = git(repo.path, "rev-parse", "HEAD")
+    git(repo.path, "checkout", "-q", "main")
+    assert not any("stale" in w for w in build_context(repo.path, repo.base, head, PRMetadata(), config).warnings)
+    config.conventions.stale_base_max_commits = 2
+    ctx = build_context(repo.path, repo.base, head, PRMetadata(), config)
+    assert any("3 commits (more than 2)" in w for w in ctx.warnings)

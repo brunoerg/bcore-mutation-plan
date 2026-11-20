@@ -80,6 +80,21 @@ class GitRepo:
             raise GitError(f"no merge base between {a} and {b}")
         return out
 
+    def commit_count(self, start: str, end: str) -> int:
+        """Number of commits reachable from ``end`` but not from ``start`` (SHAs only)."""
+        out = run_git(self.path, ["rev-list", "--count", f"{start}..{end}"]).decode().strip()
+        return int(out or 0)
+
+    def merge_commits(self, start: str, end: str, limit: int = 5) -> tuple[int, list[tuple[str, str]]]:
+        """(count, first ``limit`` (sha, subject) pairs) of merge commits in ``start..end``."""
+        count = int(run_git(self.path, ["rev-list", "--count", "--merges", f"{start}..{end}"]).decode().strip() or 0)
+        out = run_git(self.path, ["log", "--merges", f"-n{limit}", "--format=%H%x00%s", f"{start}..{end}"])
+        pairs = []
+        for line in out.decode("utf-8", errors="replace").splitlines():
+            sha, _, subject = line.partition("\0")
+            pairs.append((sha, subject))
+        return count, pairs
+
     def tree_sha(self, commit: str) -> str:
         return run_git(self.path, ["rev-parse", f"{commit}^{{tree}}"]).decode().strip()
 
@@ -251,6 +266,9 @@ class DiffResult:
     merge_base_sha: str
     head_tree_sha: str
     changes: list[RawChange]
+    commit_count: int = 0
+    merge_count: int = 0
+    merge_samples: list[tuple[str, str]] = field(default_factory=list)
 
 
 def analyze_diff(repo: GitRepo, base: str, head: str) -> DiffResult:
@@ -278,5 +296,10 @@ def analyze_diff(repo: GitRepo, base: str, head: str) -> DiffResult:
         ch.patch = patch
         if ch.status != ChangeStatus.deleted:
             ch.changed_lines, ch.deletion_anchors = parse_patch_lines(patch)
-    log.info("diff: %d changed files", len(changes))
-    return DiffResult(base_sha, head_sha, merge_base_sha, repo.tree_sha(head_sha), changes)
+    n_commits = repo.commit_count(merge_base_sha, head_sha)
+    n_merges, merges = repo.merge_commits(merge_base_sha, head_sha)
+    log.info("diff: %d changed files in %d commit(s) since the merge base", len(changes), n_commits)
+    return DiffResult(
+        base_sha, head_sha, merge_base_sha, repo.tree_sha(head_sha), changes,
+        commit_count=n_commits, merge_count=n_merges, merge_samples=merges,
+    )

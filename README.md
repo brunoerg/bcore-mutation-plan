@@ -26,7 +26,7 @@ Requires Python 3.11+ and `git`.
 git clone <this repository> mutation-planner && cd mutation-planner
 python -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'        # pydantic, tree-sitter, tree-sitter-cpp, pytest
-python -m pytest -q            # 107 tests; no network, LLM or API key needed
+python -m pytest -q            # 118 tests; no network, LLM or API key needed
 ```
 
 The system prompt (`prompts/mutation_planner_system.md`) ships inside the package, so a regular `pip install .` also works.
@@ -49,6 +49,28 @@ python -m mutation_planner \
   --output mutation-plan.json
 ```
 
+If your checkout is a fork, `origin` usually points at your fork and `bitcoin/bitcoin`
+is a remote called `upstream`. In that case, fetch both the PR and the base branch from
+`upstream`:
+
+```bash
+cd ~/bitcoin
+git remote add upstream https://github.com/bitcoin/bitcoin.git   # once, if not already set
+git fetch upstream master pull/32150/head:pr-32150
+cd -
+
+python -m mutation_planner \
+  --repo ~/bitcoin \
+  --base upstream/master \
+  --head pr-32150 \
+  --pr-number 32150 \
+  --provider claude-code --model sonnet \
+  --output mutation-plan.json
+```
+
+`--base` and `--head` accept any ref Git can resolve to a commit (branch, remote-tracking
+ref, tag or SHA); the planner resolves them and records the SHAs.
+
 For an already-merged PR, use the merge commit's parents: `--base M^1 --head M^2`.
 
 Each run writes:
@@ -57,7 +79,7 @@ Each run writes:
 |---|---|
 | `mutation-context.json` | everything the analyzer found, which is also the replay input (`--context-output`) |
 | `mutation-plan.json` | the validated plan (`--output`) |
-| `mutation-run-metadata.json` | SHAs, provider, model, prompt version and SHA-256, context SHA-256, tool version, validation status and errors (`--metadata-output`) |
+| `mutation-run-metadata.json` | SHAs, provider, model, prompt version and SHA-256, context SHA-256, tool version, number of LLM calls, validation status and errors, and the errors of every model response that failed validation (`attempt_errors`) (`--metadata-output`) |
 
 Exit codes: `0` ok, `1` the plan failed validation, `2` bad input or analysis error,
 `3` LLM provider error, `4` the analysis was too large for the context budget.
@@ -81,6 +103,7 @@ same context works with every provider:
 python -m mutation_planner --context-file mutation-context.json --provider claude-code  --model sonnet
 python -m mutation_planner --context-file mutation-context.json --provider opencode     --model PROVIDER/MODEL
 python -m mutation_planner --context-file mutation-context.json --provider opencode-zen --model MODEL_ID
+python -m mutation_planner --context-file mutation-context.json --provider static       # no LLM: deterministic baseline
 
 # Re-validate an existing plan against its context:
 python -m mutation_planner --context-file mutation-context.json --validate-plan mutation-plan.json
@@ -97,7 +120,8 @@ input, but LLM decisions can still vary between runs.
 | `--max-candidates-per-file` | 40 | candidate tests shown to the LLM per file; truncation is reported |
 | `--max-context-chars` | 600000 | LLM context budget; see [large PRs](#large-prs) |
 | `--max-call-depth` | 8 | static call-graph hops used to find indirect tests |
-| `--max-retries` | 1 | LLM retries after a validation failure (the errors are sent back) |
+| `--max-retries` | 1 | LLM retries after a validation failure that could not be [repaired](#token-usage) (the errors are sent back) |
+| `--include-inventory-index` | off | also send every unit suite, functional test and fuzz target ID, so the model can pick tests that are not candidates; adds about 20k characters on Bitcoin Core |
 | `--timeout` | 900 | LLM call timeout in seconds |
 | `--prompt-file` | `prompts/mutation_planner_system.md` | system prompt override |
 | `--pr-title`, `--pr-description` | | optional PR metadata, treated as untrusted data |
@@ -155,6 +179,46 @@ accordingly. To skip the catalogue lookup, pass `--zen-api-format` and
 `--zen-base-url`. HTTP 429 and 5xx responses are retried with backoff. Keys are never
 logged, and error messages are redacted.
 
+### Static baseline (`--provider static`)
+
+A deterministic plan built with fixed rules, with no LLM. It needs no credentials or
+network, and the same context always produces the same plan. It receives the same view
+an LLM would, and its output passes through the same validator. Use it to compare
+against LLM plans, or as a fallback when no model is available.
+
+```bash
+python -m mutation_planner --repo ~/bitcoin --base upstream/master --head pr-NNNNN \
+  --provider static --output mutation-plan.static.json
+```
+
+The rules are defined in `mutation_planner/llm/static.py`, and the plan records them as
+`prompt_version: "static-1"`:
+
+* **Selecting files.** Every changed production file with at least one detected
+  changed function is selected, with all its changed functions. Files whose changes all
+  lie outside functions (declarations, globals, macros) are skipped, and a warning says
+  so. `mutate` is true when at least one file is selected.
+* **Priority.**
+  * `high`: the path is in a consensus- or validation-critical area (`src/consensus/`,
+    `src/script/`, `src/policy/`, `src/validation.*`, `src/net_processing.*`,
+    `src/txmempool.*`, …).
+  * `medium`: at least 20 changed lines or 3 changed functions, or a changed function
+    is an RPC handler.
+  * `low`: everything else.
+* **Selecting tests.** Candidates are taken in rank order, up to the per-file budget:
+  * direct evidence first (`high` confidence);
+  * then `call_path` and `rpc_call_path` (`medium`);
+  * `module_area` candidates (`low`) only when fewer than 3 tests were found, and at
+    most 2 of them.
+
+  Candidates supported only by name similarity are never picked. A suite and its own
+  cases are never both selected.
+
+The baseline makes no semantic judgement. It mutates mechanical changes such as renames
+and logging edits, and it fills the test budget with broadly related tests. For example,
+on #32150 it chose 5 of the 6 tests the Claude plan chose, plus 5 more loosely related
+ones.
+
 ## Output interpretation
 
 ```jsonc
@@ -175,7 +239,7 @@ logged, and error messages are redacted.
     "uncertainty": "..."
   }],
   "warnings": ["..."],
-  "metadata": {"provider": "...", "model": "...", "prompt_version": "1.0", "context_sha256": "...", ...}
+  "metadata": {"provider": "...", "model": "...", "prompt_version": "1.1", "context_sha256": "...", ...}
 }
 ```
 
@@ -270,6 +334,37 @@ can also spend LLM credits on every PR; gate it with the variable above, or add 
 or author-association check. Pin actions to commit SHAs if your policy requires it.
 `tests.yml` runs this project's own test suite.
 
+## Token usage
+
+The LLM is called once per PR, and the planner keeps that call small:
+
+* **Compact view.** The LLM gets a reduced view of `mutation-context.json`. Each
+  candidate test carries its definition site and its evidence inline (relationship,
+  line, matched symbol, and the call chain for call-path evidence). Fields that repeat
+  what the candidate already says are left out: source file, test ID, category, basis
+  and the prose description. The full records stay in the context, and the validator
+  checks against those.
+* **No full inventory by default.** The model chooses from the candidates. With
+  `--include-inventory-index` it also sees every test ID and may pick a non-candidate
+  at `low` confidence. The validator checks IDs against the full inventory either way.
+* **Repair before retry.** When a plan fails validation, the planner first fixes what
+  can be fixed by removing or downgrading something the model returned. It drops files
+  that are not changed production files, unknown functions, line ranges outside the
+  changed code, unknown or duplicate tests, and evidence IDs about another test or file.
+  It moves a test listed under the wrong category, downgrades `high`/`medium` to `low`
+  when no valid evidence remains, and keeps the highest-confidence tests when the budget
+  is exceeded. Each repair is reported as an `auto-repaired:` warning in the plan. Only
+  errors that need the model (schema errors, empty reasons, or a decision that
+  contradicts the file list) cause a retry, which resends the whole context.
+* **No call when there is nothing to decide.** If no changed production file exists at
+  the head (docs-, test- or build-only PRs), the plan is `mutate: false` and is written
+  without calling the LLM (`llm_attempts: 0`). PRs that only change declarations,
+  globals or constants still go to the LLM, because such changes can matter.
+
+On bitcoin/bitcoin#36894 these changes cut the view from 103k to 38k characters (about
+26k to 10k tokens), plus about 2k tokens of system prompt. Lowering
+`--max-candidates-per-file` cuts it further.
+
 ## Large PRs
 
 The changed-file inventory and PR metadata are always kept. If the LLM view exceeds
@@ -349,7 +444,7 @@ mutation_planner/
   candidate_selection.py candidate tests and evidence (static, inferred, heuristic)
   analysis.py            pipeline orchestration, LLM view, context budget
   planner.py             single LLM call, validation, one retry, enrichment
-  validator.py           deterministic plan validation
+  validator.py           deterministic plan validation and repair
   llm/                   provider interface, claude_code, opencode_cli, opencode_zen, factory
 prompts/mutation_planner_system.md   version-controlled system prompt
 examples/mutation-plan.example.json  real plan for bitcoin/bitcoin#32150

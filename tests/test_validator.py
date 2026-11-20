@@ -5,7 +5,7 @@ import pytest
 from conftest import BASE_FILES, replace
 from mutation_planner.analysis import build_context
 from mutation_planner.schemas import LLMPlan, PRMetadata
-from mutation_planner.validator import parse_llm_plan, validate_final_plan, validate_plan
+from mutation_planner.validator import parse_llm_plan, repair_plan, validate_final_plan, validate_plan
 
 
 @pytest.fixture
@@ -165,3 +165,54 @@ def test_validate_final_plan_detects_tampering(fee_ctx):
     data = plan.model_dump(mode="json")
     data["pr"]["head_sha"] = "0" * 40
     assert any("different head" in e for e in validate_final_plan(data, fee_ctx).errors)
+
+
+def test_repair_fixes_removable_errors(fee_ctx):
+    raw = good_plan(fee_ctx)
+    f = raw["files"][0]
+    f["functions"] = ["GetMinFee", "InventedFunction"]
+    f["changed_lines"] = [{"start": 10, "end": 10}, {"start": 1, "end": 2}, {"start": 500, "end": 501}]
+    f["tests"]["unit"].append(copy.deepcopy(f["tests"]["unit"][0]))  # duplicate
+    f["tests"]["unit"].append({"id": "unit:fee_tests/imaginary", "reason": "x", "confidence": "low", "evidence": []})
+    f["tests"]["functional"].append(f["tests"]["fuzz"].pop())  # wrong category
+    f["tests"]["unit"][0]["evidence"] = f["tests"]["unit"][0]["evidence"] + ["ev-9999"]
+    raw["files"].append({**copy.deepcopy(f), "path": "doc/release-notes.md"})
+    plan, report = parse_llm_plan(raw)
+    assert not validate_plan(plan, fee_ctx, 10).ok
+
+    fixed, notes = repair_plan(plan, fee_ctx, 10)
+    report = validate_plan(fixed, fee_ctx, 10)
+    assert report.ok, report.errors
+    g = fixed.files[0]
+    assert [x.path for x in fixed.files] == ["src/policy/fees.cpp"]
+    assert g.functions == ["GetMinFee"]
+    assert [(r.start, r.end) for r in g.changed_lines] == [(10, 10)]
+    assert [t.id for t in g.tests.unit] == ["unit:fee_tests/min_fee_test"]
+    assert "ev-9999" not in g.tests.unit[0].evidence and g.tests.unit[0].confidence == "high"
+    assert [t.id for t in g.tests.fuzz] == ["fuzz:fee_rate"] and g.tests.functional == []
+    assert all(n.startswith("auto-repaired:") for n in notes) and len(notes) >= 7
+
+
+def test_repair_downgrades_unsupported_confidence_and_enforces_budget(fee_ctx):
+    raw = good_plan(fee_ctx)
+    raw["files"][0]["tests"]["unit"][0]["evidence"] = ["ev-9999"]
+    raw["files"][0]["tests"]["unit"].append({"id": "unit:fee_tests", "reason": "x", "confidence": "low", "evidence": []})
+    plan, _ = parse_llm_plan(raw)
+    fixed, notes = repair_plan(plan, fee_ctx, 2)
+    assert validate_plan(fixed, fee_ctx, 2).ok
+    u = {t.id: t for t in fixed.files[0].tests.unit}
+    assert u["unit:fee_tests/min_fee_test"].confidence == "low"
+    assert any("downgraded" in n for n in notes)
+    # 3 selections, budget 2: the medium fuzz test is kept over the two (now) low ones
+    total = sum(len(x) for x in (fixed.files[0].tests.unit, fixed.files[0].tests.functional, fixed.files[0].tests.fuzz))
+    assert total == 2 and fixed.files[0].tests.fuzz and any("over the budget" in n for n in notes)
+
+
+def test_repair_leaves_model_decisions_alone(fee_ctx):
+    raw = good_plan(fee_ctx)
+    raw["decision"]["reason"] = ""
+    raw["files"][0]["path"] = "doc/release-notes.md"
+    plan, _ = parse_llm_plan(raw)
+    fixed, _ = repair_plan(plan, fee_ctx, 10)
+    errs = validate_plan(fixed, fee_ctx, 10).errors
+    assert "decision.reason is empty" in errs and "decision.mutate is true but no files were selected" in errs
